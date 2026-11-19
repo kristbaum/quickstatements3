@@ -19,6 +19,7 @@ This repository contains version 3.0, a rewrite of [QuickStatements 2](https://w
 * **Preview** a batch and see errors before running it
 * Create and edit items and properties: statements, **qualifiers**, **references**, **ranks**, labels, descriptions, aliases and sitelinks
 * Add or remove qualifiers and references while preserving the rest of the statement
+* Link items created in the same batch with **placeholders**
 * Optionally **combine** all commands for the same entity into a single edit
 * Optionally **stop a batch** as soon as a command fails
 * **Rerun** a batch or restart a stopped one
@@ -47,6 +48,25 @@ LAST|P569|+1952-03-11T00:00:00Z/11|S248|Q36578
 ```csv
 qid,Len,Den,P31,P569,S248
 ,Douglas Adams,English writer and humorist,Q5,+1952-03-11T00:00:00Z/11,Q36578
+```
+
+**Placeholders** let a batch link items it creates itself. `CREATE` can name the new item with a placeholder in curly braces, and later commands can use it as entity or value; it is replaced by the new item's id when the batch runs. A placeholder must be defined before the commands that use it:
+
+```
+CREATE|{Alice}
+LAST|Len|"Alice"
+CREATE|{Bob}
+LAST|Len|"Bob"
+LAST|P3373|{Alice}
+{Alice}|P3373|{Bob}
+```
+
+In CSV, put the placeholder in the `qid` column to create the item, and use it as a value in later rows:
+
+```csv
+qid,Len,P3373
+{Alice},Alice,
+{Bob},Bob,{Alice}
 ```
 
 ## Compared to QuickStatements 2
