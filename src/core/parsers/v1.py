@@ -32,25 +32,39 @@ class V1CommandParser(BaseParser):
     ]
     WHAT = {"L": "label", "D": "description", "A": "alias", "S": "sitelink"}
 
+    def parse_placeholder_definition(self, value):
+        value = value.strip()
+        if not self.is_placeholder(value):
+            raise ParserException(
+                f"Invalid placeholder '{value}': use letters, digits, '_' or '-' "
+                "inside curly braces, like {Person_A}"
+            )
+        return value
+
     def parse_create(self, elements):
         llen = len(elements)
-        if llen != 1:
-            raise ParserException("CREATE command can have only 1 column")
-        else:
-            # TODO: maybe change this 'type' to 'what', to be like the others
-            return {"action": "create", "type": "item"}
+        if llen > 2:
+            raise ParserException("CREATE command can have at most 2 columns")
+        # TODO: maybe change this 'type' to 'what', to be like the others
+        data = {"action": "create", "type": "item"}
+        if llen == 2:
+            data["placeholder"] = self.parse_placeholder_definition(elements[1])
+        return data
 
     def parse_create_property(self, elements):
         llen = len(elements)
-        if llen != 2:
-            raise ParserException("CREATE PROPERTY command must have 2 columns")
+        if llen not in (2, 3):
+            raise ParserException("CREATE PROPERTY command must have 2 or 3 columns")
         else:
             datatype = elements[1]
             if datatype not in self.CREATE_PROPERTY_ALLOWED_DATATYPES:
                 raise ParserException(
                     f"CREATE PROPERTY datatype allowed values: {self.CREATE_PROPERTY_ALLOWED_DATATYPES}"
                 )
-            return {"action": "create", "type": "property", "data": datatype}
+            data = {"action": "create", "type": "property", "data": datatype}
+            if llen == 3:
+                data["placeholder"] = self.parse_placeholder_definition(elements[2])
+            return data
 
     def parse_merge(self, elements):
         llen = len(elements)
@@ -116,6 +130,8 @@ class V1CommandParser(BaseParser):
         else:
             _id = elements[1].strip()
             _split = _id.split("$")
+            if self.is_placeholder(_split[0]):
+                raise ParserException("Placeholders can not be used in statement ids")
             if len(_split) != 2:
                 raise ParserException(
                     "ITEM ID format in REMOVE STATEMENT must be Q1234$UUID"
@@ -208,6 +224,14 @@ class V1CommandParser(BaseParser):
         else:
             action = "add"
             entity = first_command
+
+        # Placeholders are case-sensitive, so undo the uppercasing
+        # done to the first column
+        original_entity = elements[0].strip()
+        if original_entity[:1] in ("-", "+"):
+            original_entity = original_entity[1:].strip()
+        if self.is_placeholder(original_entity):
+            entity = original_entity
 
         entity_type = self.get_entity_type(entity)
         logger.debug(f"{entity} is of type {entity_type}")
@@ -404,6 +428,8 @@ class V1CommandParser(BaseParser):
         commands = raw_commands.replace("||", "\n").replace("|", "\t")
         commands = [restore_placeholders(c.strip()) for c in commands.split("\n") if c.strip()]
 
+        defined_placeholders = {}
+
         for index, raw_command in enumerate(commands):
             bc = BatchCommand(
                 index=index,
@@ -466,6 +492,7 @@ class V1CommandParser(BaseParser):
                     bc.action = BatchCommand.ACTION_MERGE
                 bc.user_summary = command.pop("summary", None)
                 bc.json = command
+                self.check_placeholders(bc, defined_placeholders)
             except ParserException as e:
                 bc.status = BatchCommand.STATUS_ERROR
                 bc.message = e.message

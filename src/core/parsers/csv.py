@@ -53,6 +53,13 @@ class CSVCommandParser(BaseParser):
                     commands.append({"action": "create", "type": "item"})
                     qid = "LAST"
                     entity_type = self.get_entity_type(qid)
+                elif self.is_placeholder(cell_value):
+                    # A placeholder creates a new item that later rows can refer to
+                    commands.append(
+                        {"action": "create", "type": "item", "placeholder": cell_value}
+                    )
+                    qid = "LAST"
+                    entity_type = self.get_entity_type(qid)
                 else:
                     # Just modifying and existing one
                     qid = cell_value
@@ -186,6 +193,7 @@ class CSVCommandParser(BaseParser):
         first_line = True
         reader = csv.reader(memory_file, delimiter=",")
         index = 0
+        defined_placeholders = {}
 
         for row in reader:
             if first_line:
@@ -218,7 +226,7 @@ class CSVCommandParser(BaseParser):
 
                     logger.debug(f"Parsed line {row}")
 
-                    yield BatchCommand(
+                    bc = BatchCommand(
                         index=index,
                         json=command,
                         raw=row,
@@ -227,4 +235,10 @@ class CSVCommandParser(BaseParser):
                         status=BatchCommand.STATUS_INITIAL,
                         user_summary=user_summary,
                     )
+                    try:
+                        self.check_placeholders(bc, defined_placeholders)
+                    except ParserException as e:
+                        bc.status = BatchCommand.STATUS_ERROR
+                        bc.message = e.message
+                    yield bc
                     index += 1

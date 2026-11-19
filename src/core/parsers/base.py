@@ -3,6 +3,8 @@ import re
 from decimal import Decimal
 from django.utils.timezone import localdate
 
+from core.placeholders import is_placeholder
+
 
 class ParserException(Exception):
     def __init__(self, message):
@@ -14,6 +16,32 @@ class BaseParser(object):
     """
     Base parser. Can parse basic data ids for wikidata
     """
+
+    def is_placeholder(self, value):
+        return is_placeholder(value)
+
+    def check_placeholders(self, command, defined: dict):
+        """
+        Validates the placeholders of a parsed BatchCommand against
+        the placeholders defined by previous commands (name -> index).
+
+        Placeholders must be defined by a CREATE command before they are used.
+        Registers the placeholder if the command defines one.
+
+        Raises ParserException on errors.
+        """
+        for name in command.placeholders_used():
+            if name not in defined:
+                raise ParserException(
+                    f"Placeholder {name} is used before it is defined by a CREATE command"
+                )
+        name = command.placeholder
+        if name is not None:
+            if name in defined:
+                raise ParserException(
+                    f"Placeholder {name} is already defined by command #{defined[name]}"
+                )
+            defined[name] = command.index
 
     def is_valid_property_id(self, value):
         """
@@ -129,6 +157,8 @@ class BaseParser(object):
         if entity is not None:
             if entity == "LAST" or self.is_valid_item_id(entity):
                 return "item"
+            if self.is_placeholder(entity):
+                return "item"
             if self.is_valid_property_id(entity):
                 return "property"
             if self.is_valid_lexeme_id(entity):
@@ -177,6 +207,8 @@ class BaseParser(object):
         """
         if v == "LAST":
             return {"type": "wikibase-entityid", "value": "LAST"}
+        if self.is_placeholder(v):
+            return {"type": "wikibase-entityid", "value": v}
         if self.is_valid_entity_id(v):
             return {"type": "wikibase-entityid", "value": v.upper()}
         return None
