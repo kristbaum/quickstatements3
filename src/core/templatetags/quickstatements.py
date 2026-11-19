@@ -9,6 +9,8 @@ from django.utils.html import escape
 from django.utils.safestring import mark_safe
 from django.utils.translation import pgettext
 
+from core.placeholders import is_placeholder
+
 register = template.Library()
 logger = logging.getLogger(__name__)
 
@@ -20,7 +22,13 @@ def render_entity_label(entity_id):
     )
 
 
+def render_placeholder(value):
+    return f'<span class="placeholder">{escape(value)}</span>'
+
+
 def render_entity_datavalue(command, value):
+    if is_placeholder(value):
+        return render_placeholder(value)
     label = render_entity_label(value)
     value = escape(value)
     link = f'<a href="{command.batch.wikibase.url}/entity/{value}">[{value}]</a>'
@@ -155,6 +163,11 @@ def render_monolingualtext_datavalue(command, value):
 
 def render_default_datavalue(command, value):
     return escape(str(value))
+
+
+@register.filter(name="is_placeholder")
+def is_placeholder_filter(value):
+    return is_placeholder(value)
 
 
 @register.simple_tag

@@ -16,6 +16,8 @@
         {% if command.entity_id %}
           {% if command.entity_id == "LAST" %}
           LAST
+          {% elif command.entity_id|is_placeholder %}
+          <span class="placeholder">{{ command.entity_id }}</span>
           {% else %}
           {% label_display command.entity_id %}
             {% if command.entity_url %}
@@ -24,6 +26,8 @@
             {{ command.entity_info }}
             {% endif %}
           {% endif %}
+        {% elif command.placeholder %}
+          <span class="placeholder">{{ command.placeholder }}</span>
         {% endif %}
       </td>
 
