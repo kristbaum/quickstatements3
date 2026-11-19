@@ -560,6 +560,9 @@ class Batch(models.Model):
                 state = current.final_combining_state
                 if current.action == BatchCommand.ACTION_CREATE:
                     last_id = current.response_id
+                elif current.is_entity_creation() and current.response_id:
+                    # A combined creation is sent by the last command of the group
+                    last_id = current.response_id
 
                 current = upcoming
 
