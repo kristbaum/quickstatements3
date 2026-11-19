@@ -75,6 +75,13 @@ class LastCouldNotBeEvaluated(ApiException):
         return super().__init__("LAST could not be evaluated.")
 
 
+class PlaceholderCouldNotBeEvaluated(ApiException):
+    def __init__(self, placeholders):
+        self.placeholders = list(placeholders)
+        names = ", ".join(self.placeholders)
+        super().__init__(f"Placeholder could not be evaluated: {names}")
+
+
 class UserError(ApiException):
     def __init__(self, status, response_code, response_message, response_json):
         self.status = status

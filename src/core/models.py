@@ -24,6 +24,7 @@ from requests.exceptions import HTTPError
 from urllib3.util.retry import Retry
 
 from .decorators import cache_with_first_arg
+from .placeholders import is_placeholder
 from .exceptions import (
     ApiException,
     EntityTypeNotImplemented,
@@ -35,6 +36,7 @@ from .exceptions import (
     NoStatementsForThatProperty,
     NoStatementsWithThatValue,
     NoValueTypeForThisDataType,
+    PlaceholderCouldNotBeEvaluated,
     ServerError,
     UnauthorizedToken,
     UserError,
@@ -298,6 +300,8 @@ class Client:
             base = "/entities/properties"
         elif entity_id.upper() == "LAST":
             raise LastCouldNotBeEvaluated()
+        elif is_placeholder(entity_id):
+            raise PlaceholderCouldNotBeEvaluated([entity_id])
         else:
             raise EntityTypeNotImplemented(entity_id)
 
@@ -533,6 +537,7 @@ class Batch(models.Model):
                     return self.block_by(command)
 
         last_id = None
+        placeholders = self.bound_placeholders()
         state = CombiningState.empty()
         commands = self.commands().exclude(status=BatchCommand.STATUS_DONE)
 
@@ -550,13 +555,15 @@ class Batch(models.Model):
                 except StopIteration:
                     upcoming = None
 
-                current.check_combination(state, upcoming)
+                current.check_combination(state, upcoming, placeholders)
                 current.update_last_id(last_id)
+                current.resolve_placeholders_or_error(placeholders)
                 current.run(client)
 
                 if current.is_error_status() and self.block_on_errors:
                     return self.block_by(current)
 
+                current.bind_placeholders(placeholders)
                 state = current.final_combining_state
                 if current.action == BatchCommand.ACTION_CREATE:
                     last_id = current.response_id
@@ -575,6 +582,26 @@ class Batch(models.Model):
             self.save()
             return
         self.finish()
+
+    def bound_placeholders(self) -> dict:
+        """
+        Returns the placeholders already bound to entity ids, as {placeholder: entity_id}.
+
+        Rebuilt from the finished create commands, so that
+        restarting or rerunning a batch keeps the placeholders.
+        """
+        mapping = {}
+        creations = self.commands().filter(
+            status=BatchCommand.STATUS_DONE,
+            operation__in=[
+                BatchCommand.Operation.CREATE_ITEM,
+                BatchCommand.Operation.CREATE_PROPERTY,
+            ],
+        )
+        for command in creations:
+            if command.placeholder and command.entity_id:
+                mapping[command.placeholder] = command.entity_id
+        return mapping
 
     def start(self):
         logger.debug(f"[{self}] running...")
@@ -997,6 +1024,13 @@ class BatchCommand(models.Model):
                 "LAST could not be evaluated.",
             ),
         )
+        PLACEHOLDER_NOT_EVALUATED = (
+            "placeholder_not_evaluated",
+            pgettext_lazy(
+                "batchcommand-py-error-placeholder-not-evaluated",
+                "Placeholder could not be evaluated.",
+            ),
+        )
 
     error = models.TextField(
         null=True,
@@ -1093,7 +1127,7 @@ class BatchCommand(models.Model):
     def entity_url(self):
         entity_id = self.entity_id
         base = self.batch.wikibase.url
-        if entity_id and entity_id != "LAST":
+        if entity_id and entity_id != "LAST" and not is_placeholder(entity_id):
             return f"{base}/entity/{entity_id}"
         else:
             return ""
@@ -1179,7 +1213,7 @@ class BatchCommand(models.Model):
                 and ref["value"]["type"] == "wikibase-entityid"
             ):
                 result.add(value)
-        return result
+        return {i for i in result if not is_placeholder(i)}
 
     @property
     def what_plural_lowercase(self):
@@ -1445,6 +1479,112 @@ class BatchCommand(models.Model):
             self.save()
 
     # -----------------
+    # Placeholder related methods
+    # -----------------
+
+    @property
+    def placeholder(self) -> Optional[str]:
+        """
+        The placeholder defined by this command, if it is a CREATE with a placeholder.
+        """
+        return self.json.get("placeholder")
+
+    def _entity_value_dicts(self):
+        """
+        Yields the parser value dicts holding entity ids: the main value,
+        the switched value, qualifier values and reference values.
+        """
+        candidates = [self.json.get("value"), self.json.get("value_switch")]
+        candidates.extend(q.get("value") for q in self.json.get("qualifiers", []))
+        for block in self.json.get("references", []):
+            candidates.extend(part.get("value") for part in block)
+        for value in candidates:
+            if isinstance(value, dict) and value.get("type") == "wikibase-entityid":
+                yield value
+
+    def placeholders_used(self) -> List[str]:
+        """
+        Returns the placeholders this command refers to, in order and without repetition.
+        """
+        used = []
+        if is_placeholder(self.entity_id):
+            used.append(self.entity_id)
+        for value in self._entity_value_dicts():
+            if is_placeholder(value["value"]) and value["value"] not in used:
+                used.append(value["value"])
+        return used
+
+    def unresolved_placeholders(self, mapping: dict, allowed_entity: Optional[str] = None):
+        """
+        Returns the placeholders that are not bound in `mapping`.
+
+        `allowed_entity` is the placeholder of the entity that is being created
+        by the current combining group: as the command's entity it does not
+        need an id yet, since the whole group is sent as one creation.
+        """
+        unresolved = []
+        for name in self.placeholders_used():
+            if name in mapping:
+                continue
+            is_entity_being_created = name == allowed_entity and name == self.entity_id
+            if is_entity_being_created and not any(
+                v["value"] == name for v in self._entity_value_dicts()
+            ):
+                continue
+            unresolved.append(name)
+        return unresolved
+
+    def resolve_placeholders(self, mapping: dict):
+        """
+        Replaces the placeholders with the bound entity ids and saves the command.
+
+        Raises PlaceholderCouldNotBeEvaluated if any placeholder is not bound.
+        """
+        if not self.placeholders_used():
+            return
+        allowed = getattr(self, "_group_placeholder", None)
+        unresolved = self.unresolved_placeholders(mapping, allowed)
+        if unresolved:
+            raise PlaceholderCouldNotBeEvaluated(unresolved)
+
+        entity_id = self.entity_id
+        if is_placeholder(entity_id) and entity_id in mapping:
+            self.set_entity_id(mapping[entity_id])
+        for value in self._entity_value_dicts():
+            if is_placeholder(value["value"]):
+                value["value"] = mapping[value["value"]]
+        if hasattr(self, "_value_dict"):
+            del self._value_dict
+        self.save()
+
+    def resolve_placeholders_or_error(self, mapping: dict):
+        """
+        Resolves the placeholders, setting the error status if it fails.
+        """
+        if self.status != BatchCommand.STATUS_INITIAL:
+            return
+        try:
+            self.resolve_placeholders(mapping)
+        except PlaceholderCouldNotBeEvaluated as e:
+            label = str(self.Error.PLACEHOLDER_NOT_EVALUATED.label)
+            names = ", ".join(e.placeholders)
+            self.error_with_value(self.Error.PLACEHOLDER_NOT_EVALUATED, f"{label} {names}")
+
+    def bind_placeholders(self, mapping: dict):
+        """
+        Adds the placeholders created by this command (or by the
+        commands combined into it) to `mapping`, once they are done.
+        """
+        for command in [self, *getattr(self, "previous_commands", [])]:
+            if (
+                command.placeholder
+                and command.status == BatchCommand.STATUS_DONE
+                and command.entity_id
+                and not is_placeholder(command.entity_id)
+            ):
+                mapping[command.placeholder] = command.entity_id
+
+    # -----------------
     # Wikibase API basic methods
     # -----------------
 
@@ -1486,6 +1626,10 @@ class BatchCommand(models.Model):
             self.error_with_value(self.Error.NO_REFERENCE_PARTS)
         except LastCouldNotBeEvaluated:
             self.error_with_value(self.Error.LAST_NOT_EVALUATED)
+        except PlaceholderCouldNotBeEvaluated as e:
+            label = str(self.Error.PLACEHOLDER_NOT_EVALUATED.label)
+            names = ", ".join(e.placeholders)
+            self.error_with_value(self.Error.PLACEHOLDER_NOT_EVALUATED, f"{label} {names}")
         except UserError as e:
             if e.response_message == "Invalid path parameter: 'site_id'":
                 self.error_with_value(self.Error.SITELINK_INVALID)
@@ -1562,12 +1706,25 @@ class BatchCommand(models.Model):
         """
         return getattr(self, "_can_combine_with_next", False)
 
-    def check_combination(self, state: CombiningState, next: Optional["BatchCommand"]):
+    def check_combination(
+        self,
+        state: CombiningState,
+        next: Optional["BatchCommand"],
+        placeholders: Optional[dict] = None,
+    ):
         """
         Caches the previous_entity_json as given, even if None.
 
         Checks combination with next command if available.
+
+        `placeholders` are the placeholders already bound to entity ids.
+        A command referring to a placeholder that is not bound yet,
+        i.e. the entity being created by this group, is not combined,
+        so that the entity is created first.
         """
+        placeholders = placeholders or {}
+        head = state.commands[-1] if state.commands else self
+        self._group_placeholder = None if head.is_not_create_entity() else head.placeholder
         self._can_combine_with_next = (
             self.batch.combine_commands
             and self.operation_is_combinable()
@@ -1575,6 +1732,7 @@ class BatchCommand(models.Model):
             and next.operation_is_combinable()
             and next.is_not_create_entity()
             and self.has_combinable_id_with(next)
+            and not next.unresolved_placeholders(placeholders, self._group_placeholder)
         )
         self.previous_entity_json = state.entity
         self.previous_commands = state.commands
@@ -1584,9 +1742,17 @@ class BatchCommand(models.Model):
         Returns True if `self` is CREATE_ITEM or CREATE_PROPERTY and `next`
         has LAST as entity id, or if both have the same entity id.
         """
+        group_placeholder = getattr(self, "_group_placeholder", None)
+
+        def key(entity_id):
+            # Inside a group started by `CREATE {A}`, `{A}` and LAST are the same entity
+            if group_placeholder is not None and entity_id == group_placeholder:
+                return "LAST"
+            return entity_id
+
         create_operations = [self.Operation.CREATE_ITEM, self.Operation.CREATE_PROPERTY]
-        return (self.operation in create_operations and next.entity_id == "LAST") or (
-            self.entity_id == next.entity_id
+        return (self.operation in create_operations and key(next.entity_id) == "LAST") or (
+            key(self.entity_id) == key(next.entity_id)
         )
 
     def update_combining_state(self, client: Client):
@@ -1651,6 +1817,8 @@ class BatchCommand(models.Model):
         else:
             if self.entity_id == "LAST":
                 raise LastCouldNotBeEvaluated()
+            if is_placeholder(self.entity_id):
+                raise PlaceholderCouldNotBeEvaluated([self.entity_id])
             return client.get_entity(self.entity_id)
 
     def get_previous_entity_json(self, client: Client):
